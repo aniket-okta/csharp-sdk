@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Net.Http.Headers;
 using ModelContextProtocol.Authentication;
 using System.Text.Encodings.Web;
 
@@ -55,17 +56,29 @@ public partial class McpAuthenticationHandler : AuthenticationHandler<McpAuthent
             return false;
         }
 
-        var deriveResourceUriBuilder = new UriBuilder(Request.Scheme, Request.Host.Host)
+        // Build the derived resource string directly without trailing slash
+        var scheme = Request.Scheme;
+        var host = Request.Host.Host;
+        var port = Request.Host.Port;
+        var path = $"{Request.PathBase}{resourceSuffix}".TrimEnd('/');
+        
+        string derivedResource;
+        if (port.HasValue && !IsDefaultPort(scheme, port.Value))
         {
-            Path = $"{Request.PathBase}{resourceSuffix}",
-        };
-
-        if (Request.Host.Port is not null)
+            derivedResource = $"{scheme}://{host}:{port.Value}{path}";
+        }
+        else
         {
-            deriveResourceUriBuilder.Port = Request.Host.Port.Value;
+            derivedResource = $"{scheme}://{host}{path}";
         }
 
-        return await HandleResourceMetadataRequestAsync(deriveResourceUriBuilder.Uri);
+        return await HandleResourceMetadataRequestAsync(derivedResource);
+    }
+
+    private static bool IsDefaultPort(string scheme, int port)
+    {
+        return (scheme.Equals("http", StringComparison.OrdinalIgnoreCase) && port == 80) || 
+               (scheme.Equals("https", StringComparison.OrdinalIgnoreCase) && port == 443);
     }
 
     /// <summary>
@@ -127,9 +140,9 @@ public partial class McpAuthenticationHandler : AuthenticationHandler<McpAuthent
         return path.StartsWith('/') ? path : $"/{path}";
     }
 
-    private async Task<bool> HandleResourceMetadataRequestAsync(Uri? derivedResourceUri = null)
+    private async Task<bool> HandleResourceMetadataRequestAsync(string? derivedResource = null)
     {
-        var resourceMetadata = CloneResourceMetadata(Options.ResourceMetadata, derivedResourceUri);
+        var resourceMetadata = Options.ResourceMetadata?.Clone(derivedResource);
 
         if (Options.Events.OnResourceMetadataRequest is not null)
         {
@@ -164,7 +177,7 @@ public partial class McpAuthenticationHandler : AuthenticationHandler<McpAuthent
             throw new InvalidOperationException("ResourceMetadata has not been configured. Please set McpAuthenticationOptions.ResourceMetadata or ensure context.ResourceMetadata is set inside McpAuthenticationOptions.Events.OnResourceMetadataRequest.");
         }
 
-        resourceMetadata.Resource ??= derivedResourceUri;
+        resourceMetadata.Resource ??= derivedResource;
 
         if (resourceMetadata.Resource is null)
         {
@@ -185,42 +198,10 @@ public partial class McpAuthenticationHandler : AuthenticationHandler<McpAuthent
         // Get the absolute URI for the resource metadata
         string rawPrmDocumentUri = GetAbsoluteResourceMetadataUri();
 
-        properties ??= new AuthenticationProperties();
-
-        // Store the resource_metadata in properties in case other handlers need it
-        properties.Items["resource_metadata"] = rawPrmDocumentUri;
-
         // Add the WWW-Authenticate header with Bearer scheme and resource metadata
-        string headerValue = $"Bearer realm=\"{Scheme.Name}\", resource_metadata=\"{rawPrmDocumentUri}\"";
-        Response.Headers.Append("WWW-Authenticate", headerValue);
-
+        string headerValue = $"Bearer resource_metadata=\"{rawPrmDocumentUri}\"";
+        Response.Headers.Append(HeaderNames.WWWAuthenticate, headerValue);
         return base.HandleChallengeAsync(properties);
-    }
-
-    internal static ProtectedResourceMetadata? CloneResourceMetadata(ProtectedResourceMetadata? resourceMetadata, Uri? derivedResourceUri = null)
-    {
-        if (resourceMetadata is null)
-        {
-            return null;
-        }
-
-        return new ProtectedResourceMetadata
-        {
-            Resource = resourceMetadata.Resource ?? derivedResourceUri,
-            AuthorizationServers = [.. resourceMetadata.AuthorizationServers],
-            BearerMethodsSupported = [.. resourceMetadata.BearerMethodsSupported],
-            ScopesSupported = [.. resourceMetadata.ScopesSupported],
-            JwksUri = resourceMetadata.JwksUri,
-            ResourceSigningAlgValuesSupported = resourceMetadata.ResourceSigningAlgValuesSupported is not null ? [.. resourceMetadata.ResourceSigningAlgValuesSupported] : null,
-            ResourceName = resourceMetadata.ResourceName,
-            ResourceDocumentation = resourceMetadata.ResourceDocumentation,
-            ResourcePolicyUri = resourceMetadata.ResourcePolicyUri,
-            ResourceTosUri = resourceMetadata.ResourceTosUri,
-            TlsClientCertificateBoundAccessTokens = resourceMetadata.TlsClientCertificateBoundAccessTokens,
-            AuthorizationDetailsTypesSupported = resourceMetadata.AuthorizationDetailsTypesSupported is not null ? [.. resourceMetadata.AuthorizationDetailsTypesSupported] : null,
-            DpopSigningAlgValuesSupported = resourceMetadata.DpopSigningAlgValuesSupported is not null ? [.. resourceMetadata.DpopSigningAlgValuesSupported] : null,
-            DpopBoundAccessTokensRequired = resourceMetadata.DpopBoundAccessTokensRequired
-        };
     }
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Resource metadata request host did not match configured host '{ConfiguredHost}'.")]

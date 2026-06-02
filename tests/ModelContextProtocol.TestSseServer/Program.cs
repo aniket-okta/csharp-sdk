@@ -85,12 +85,7 @@ public class Program
                     Name = $"Resource {i + 1}",
                     MimeType = "application/octet-stream"
                 });
-                resourceContents.Add(new BlobResourceContents
-                {
-                    Uri = uri,
-                    MimeType = "application/octet-stream",
-                    Blob = Convert.ToBase64String(buffer)
-                });
+                resourceContents.Add(BlobResourceContents.FromBytes(buffer, uri, "application/octet-stream"));
             }
         }
 
@@ -150,16 +145,39 @@ public class Program
                                     "required": ["prompt", "maxTokens"]
                                 }
                                 """),
+                        },
+                        new Tool
+                        {
+                            Name = "longRunning",
+                            Description = "Simulates a long-running operation that supports task-based execution.",
+                            InputSchema = JsonElement.Parse("""
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "durationMs": {
+                                            "type": "number",
+                                            "description": "Duration of the operation in milliseconds"
+                                        }
+                                    },
+                                    "required": ["durationMs"]
+                                }
+                                """),
+                            Execution = new ToolExecution
+                            {
+                                TaskSupport = ToolTaskSupport.Optional
+                            }
                         }
                     ]
                 };
             },
+
             CallToolHandler = async (request, cancellationToken) =>
             {
                 if (request.Params is null)
                 {
                     throw new McpProtocolException("Missing required parameter 'name'", McpErrorCode.InvalidParams);
                 }
+
                 if (request.Params.Name == "echo")
                 {
                     if (request.Params.Arguments is null || !request.Params.Arguments.TryGetValue("message", out var message))
@@ -194,14 +212,27 @@ public class Program
                         Content = [new TextContentBlock { Text = $"LLM sampling result: {sampleResult.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text}" }]
                     };
                 }
+                else if (request.Params.Name == "longRunning")
+                {
+                    if (request.Params.Arguments is null || !request.Params.Arguments.TryGetValue("durationMs", out var durationMsValue))
+                    {
+                        throw new McpProtocolException("Missing required argument 'durationMs'", McpErrorCode.InvalidParams);
+                    }
+                    int durationMs = Convert.ToInt32(durationMsValue.ToString());
+                    await Task.Delay(durationMs, cancellationToken);
+                    return new CallToolResult
+                    {
+                        Content = [new TextContentBlock { Text = $"Long-running operation completed after {durationMs}ms" }]
+                    };
+                }
                 else
                 {
                     throw new McpProtocolException($"Unknown tool: '{request.Params.Name}'", McpErrorCode.InvalidParams);
                 }
             },
+
             ListResourceTemplatesHandler = async (request, cancellationToken) =>
             {
-
                 return new ListResourceTemplatesResult
                 {
                     ResourceTemplates = [
@@ -213,10 +244,12 @@ public class Program
                     ]
                 };
             },
+
             ListResourcesHandler = async (request, cancellationToken) =>
             {
                 int startIndex = 0;
                 var requestParams = request.Params ?? new();
+
                 if (requestParams.Cursor is not null)
                 {
                     try
@@ -244,9 +277,10 @@ public class Program
                     Resources = resources.GetRange(startIndex, endIndex - startIndex)
                 };
             },
+
             ReadResourceHandler = async (request, cancellationToken) =>
             {
-                if (request.Params?.Uri is null)
+                if (request.Params.Uri is null)
                 {
                     throw new McpProtocolException("Missing required argument 'uri'", McpErrorCode.InvalidParams);
                 }
@@ -280,6 +314,7 @@ public class Program
                     Contents = [contents]
                 };
             },
+
             ListPromptsHandler = async (request, cancellationToken) =>
             {
                 return new ListPromptsResult
@@ -313,13 +348,16 @@ public class Program
                     ]
                 };
             },
+
             GetPromptHandler = async (request, cancellationToken) =>
             {
                 if (request.Params is null)
                 {
                     throw new McpProtocolException("Missing required parameter 'name'", McpErrorCode.InvalidParams);
                 }
+
                 List<PromptMessage> messages = [];
+
                 if (request.Params.Name == "simple_prompt")
                 {
                     messages.Add(new PromptMessage
@@ -347,7 +385,7 @@ public class Program
                         Role = Role.User,
                         Content = new ImageContentBlock
                         {
-                            Data = MCP_TINY_IMAGE,
+                            Data = System.Text.Encoding.UTF8.GetBytes(MCP_TINY_IMAGE),
                             MimeType = "image/png"
                         }
                     });
@@ -361,7 +399,7 @@ public class Program
                 {
                     Messages = messages
                 };
-            }
+            },
         };
     }
 
@@ -421,7 +459,7 @@ public class Program
         }
 
         builder.Services.AddMcpServer(ConfigureOptions)
-            .WithHttpTransport();
+            .WithHttpTransport(options => options.EnableLegacySse = true);
 
         var app = builder.Build();
 

@@ -18,6 +18,9 @@ public abstract partial class McpSession : IAsyncDisposable
     /// <param name="serializerOptions">The options governing request serialization.</param>
     /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
     /// <returns>A task that represents the asynchronous operation. The task result contains the deserialized result.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="method"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="method"/> is empty or composed entirely of whitespace.</exception>
+    /// <exception cref="McpException">The request failed or the server returned an error response.</exception>
     public ValueTask<TResult> SendRequestAsync<TParameters, TResult>(
         string method,
         TParameters parameters,
@@ -46,7 +49,7 @@ public abstract partial class McpSession : IAsyncDisposable
     /// <param name="method">The JSON-RPC method name to invoke.</param>
     /// <param name="parameters">The request parameters.</param>
     /// <param name="parametersTypeInfo">The type information for request parameter serialization.</param>
-    /// <param name="resultTypeInfo">The type information for request parameter deserialization.</param>
+    /// <param name="resultTypeInfo">The type information for result deserialization.</param>
     /// <param name="requestId">The request ID for the request.</param>
     /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
     /// <returns>A task that represents the asynchronous operation. The task result contains the deserialized result.</returns>
@@ -135,7 +138,7 @@ public abstract partial class McpSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a notification to the server with parameters.
+    /// Sends a notification to the connected session with parameters.
     /// </summary>
     /// <param name="method">The JSON-RPC method name to invoke.</param>
     /// <param name="parameters">The request parameters.</param>

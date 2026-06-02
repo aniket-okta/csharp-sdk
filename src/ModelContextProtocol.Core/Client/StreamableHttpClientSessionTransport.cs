@@ -1,10 +1,13 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.ServerSentEvents;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ModelContextProtocol.Protocol;
 using System.Threading.Channels;
+using System.Net;
 
 namespace ModelContextProtocol.Client;
 
@@ -18,11 +21,12 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
 
     private readonly McpHttpClient _httpClient;
     private readonly HttpClientTransportOptions _options;
-    private readonly CancellationTokenSource _connectionCts;
+    private readonly CancellationTokenSource _connectionCts = new();
     private readonly ILogger _logger;
 
     private string? _negotiatedProtocolVersion;
     private Task? _getReceiveTask;
+    private volatile ClientTransportClosedException? _disconnectError;
 
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
     private bool _disposed;
@@ -40,7 +44,6 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
 
         _options = transportOptions;
         _httpClient = httpClient;
-        _connectionCts = new CancellationTokenSource();
         _logger = (ILogger?)loggerFactory?.CreateLogger<HttpClientTransport>() ?? NullLogger.Instance;
 
         // We connect with the initialization request with the MCP transport. This means that any errors won't be observed
@@ -60,7 +63,7 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
     {
         // Immediately dispose the response. SendHttpRequestAsync only returns the response so the auto transport can look at it.
         using var response = await SendHttpRequestAsync(message, cancellationToken).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        await response.EnsureSuccessStatusCodeWithResponseBodyAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // This is used by the auto transport so it can fall back and try SSE given a non-200 response without catching an exception.
@@ -73,6 +76,8 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
                 $"Cannot send '{RequestMethods.Initialize}' when {nameof(HttpClientTransportOptions)}.{nameof(HttpClientTransportOptions.KnownSessionId)} is configured. " +
                 $"Call {nameof(McpClient)}.{nameof(McpClient.ResumeSessionAsync)} to resume existing sessions.");
         }
+
+        LogTransportSendingMessageSensitive(message);
 
         using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _connectionCts.Token);
         cancellationToken = sendCts.Token;
@@ -87,11 +92,20 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
 
         CopyAdditionalHeaders(httpRequestMessage.Headers, _options.AdditionalHeaders, SessionId, _negotiatedProtocolVersion);
 
+        AddMcpRequestHeaders(httpRequestMessage.Headers, message);
+
         var response = await _httpClient.SendAsync(httpRequestMessage, message, cancellationToken).ConfigureAwait(false);
 
         // We'll let the caller decide whether to throw or fall back given an unsuccessful response.
         if (!response.IsSuccessStatusCode)
         {
+            // Per the MCP spec, a 404 response to a request containing an Mcp-Session-Id
+            // indicates the session has ended. Signal completion so McpClient.Completion resolves.
+            if (response.StatusCode == HttpStatusCode.NotFound && SessionId is not null)
+            {
+                SetSessionExpired();
+            }
+
             return response;
         }
 
@@ -105,8 +119,18 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
         }
         else if (response.Content.Headers.ContentType?.MediaType == "text/event-stream")
         {
-            using var responseBodyStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-            rpcResponseOrError = await ProcessSseResponseAsync(responseBodyStream, rpcRequest, cancellationToken).ConfigureAwait(false);
+            var sseState = new SseStreamState();
+            using var responseBodyStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var sseResponse = await ProcessSseResponseAsync(responseBodyStream, rpcRequest, sseState, cancellationToken).ConfigureAwait(false);
+            rpcResponseOrError = sseResponse.Response;
+
+            // Resumability: If POST SSE stream ended without a response but we have a Last-Event-ID (from priming),
+            // attempt to resume by sending a GET request with Last-Event-ID header. The server will replay
+            // events from the event store, allowing us to receive the pending response.
+            if (rpcResponseOrError is null && rpcRequest is not null && sseState.LastEventId is not null)
+            {
+                rpcResponseOrError = await SendGetSseRequestWithRetriesAsync(rpcRequest, sseState, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (rpcRequest is null)
@@ -155,7 +179,7 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
                 // Send DELETE request to terminate the session. Only send if we have a session ID, per MCP spec.
                 if (_options.OwnsSession && !string.IsNullOrEmpty(SessionId))
                 {
-                    await SendDeleteRequest();
+                    await SendDeleteRequest().ConfigureAwait(false);
                 }
 
                 if (_getReceiveTask != null)
@@ -170,10 +194,6 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
             {
                 LogTransportShutdownFailed(Name, ex);
             }
-            finally
-            {
-                _connectionCts.Dispose();
-            }
         }
         finally
         {
@@ -181,61 +201,178 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
             // This class isn't directly exposed to public callers, so we don't have to worry about changing the _state in this case.
             if (_options.TransportMode is not HttpTransportMode.AutoDetect || _getReceiveTask is not null)
             {
-                SetDisconnected();
+                // _disconnectError is set when the server returns 404 indicating session expiry.
+                // When null, this is a graceful client-initiated closure (no error).
+                SetDisconnected(_disconnectError ?? new ClientTransportClosedException(new HttpClientCompletionDetails()));
             }
         }
     }
 
     private async Task ReceiveUnsolicitedMessagesAsync()
     {
-        // Send a GET request to handle any unsolicited messages not sent over a POST response.
-        using var request = new HttpRequestMessage(HttpMethod.Get, _options.Endpoint);
-        request.Headers.Accept.Add(s_textEventStreamMediaType);
-        CopyAdditionalHeaders(request.Headers, _options.AdditionalHeaders, SessionId, _negotiatedProtocolVersion);
+        var state = new SseStreamState();
 
-        // Server support for the GET request is optional. If it fails, we don't care. It just means we won't receive unsolicited messages.
-        HttpResponseMessage response;
-        try
+        // Continuously receive unsolicited messages until canceled or disconnected
+        while (!_connectionCts.Token.IsCancellationRequested && IsConnected)
         {
-            response = await _httpClient.SendAsync(request, message: null, _connectionCts.Token).ConfigureAwait(false);
-        }
-        catch (HttpRequestException)
-        {
-            return;
-        }
+            await SendGetSseRequestWithRetriesAsync(
+                relatedRpcRequest: null,
+                state,
+                _connectionCts.Token).ConfigureAwait(false);
 
-        using (response)
-        {
-            if (!response.IsSuccessStatusCode)
+            // If we exhausted retries without receiving any events, stop trying
+            if (state.LastEventId is null)
             {
                 return;
             }
-
-            using var responseStream = await response.Content.ReadAsStreamAsync(_connectionCts.Token).ConfigureAwait(false);
-            await ProcessSseResponseAsync(responseStream, relatedRpcRequest: null, _connectionCts.Token).ConfigureAwait(false);
         }
     }
 
-    private async Task<JsonRpcMessageWithId?> ProcessSseResponseAsync(Stream responseStream, JsonRpcRequest? relatedRpcRequest, CancellationToken cancellationToken)
+    /// <summary>
+    /// Sends a GET request for SSE with retry logic and resumability support.
+    /// </summary>
+    private async Task<JsonRpcMessageWithId?> SendGetSseRequestWithRetriesAsync(
+        JsonRpcRequest? relatedRpcRequest,
+        SseStreamState state,
+        CancellationToken cancellationToken)
     {
-        await foreach (SseItem<string> sseEvent in SseParser.Create(responseStream).EnumerateAsync(cancellationToken).ConfigureAwait(false))
+        // When LastEventId is null, the first attempt is the initial GET SSE connection (not a reconnection),
+        // so we start at -1 to avoid counting it against MaxReconnectionAttempts.
+        // When LastEventId is already set, all attempts are true reconnections, so we start at 0.
+        int attempt = state.LastEventId is null ? -1 : 0;
+
+        // Delay before first attempt if we're reconnecting (have a Last-Event-ID)
+        bool shouldDelay = state.LastEventId is not null;
+
+        while (attempt < _options.MaxReconnectionAttempts)
         {
-            if (sseEvent.EventType != "message")
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (shouldDelay)
             {
+                var delay = state.RetryInterval ?? _options.DefaultReconnectionInterval;
+
+                // Subtract time already elapsed since the SSE stream ended to more accurately
+                // honor the retry interval. Without this, processing overhead (HTTP response
+                // disposal, condition checks, etc.) inflates the observed reconnection delay.
+                if (state.StreamEndedTimestamp != 0)
+                {
+                    delay -= ElapsedSince(state.StreamEndedTimestamp);
+                }
+
+                if (delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            shouldDelay = true;
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, _options.Endpoint);
+            request.Headers.Accept.Add(s_textEventStreamMediaType);
+            CopyAdditionalHeaders(request.Headers, _options.AdditionalHeaders, SessionId, _negotiatedProtocolVersion, state.LastEventId);
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.SendAsync(request, message: null, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException)
+            {
+                attempt++;
                 continue;
             }
 
-            var rpcResponseOrError = await ProcessMessageAsync(sseEvent.Data, relatedRpcRequest, cancellationToken).ConfigureAwait(false);
-
-            // The server SHOULD end the HTTP response body here anyway, but we won't leave it to chance. This transport makes
-            // a GET request for any notifications that might need to be sent after the completion of each POST.
-            if (rpcResponseOrError is not null)
+            using (response)
             {
-                return rpcResponseOrError;
+                if (response.StatusCode >= HttpStatusCode.InternalServerError)
+                {
+                    // Server error; retry.
+                    attempt++;
+                    continue;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    // Per the MCP spec, a 404 response to a request containing an Mcp-Session-Id
+                    // indicates the session has ended. Signal completion so McpClient.Completion resolves.
+                    if (response.StatusCode == HttpStatusCode.NotFound && SessionId is not null)
+                    {
+                        SetSessionExpired();
+                    }
+
+                    // If the server could be reached but returned a non-success status code,
+                    // retrying likely won't change that.
+                    return null;
+                }
+
+                using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                var sseResponse = await ProcessSseResponseAsync(responseStream, relatedRpcRequest, state, cancellationToken).ConfigureAwait(false);
+
+                if (sseResponse.Response is { } rpcResponseOrError)
+                {
+                    return rpcResponseOrError;
+                }
+
+                // If we reach here, then the stream closed without the response.
+
+                if (sseResponse.IsNetworkError || state.LastEventId is null)
+                {
+                    // No event ID means server may not support resumability; don't retry indefinitely.
+                    attempt++;
+                }
+                else
+                {
+                    // We have an event ID, so we continue polling to receive more events.
+                    // The server should eventually send a response or return an error.
+                    attempt = 0;
+                }
             }
         }
 
         return null;
+    }
+
+    private async Task<SseResponse> ProcessSseResponseAsync(
+        Stream responseStream,
+        JsonRpcRequest? relatedRpcRequest,
+        SseStreamState state,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (SseItem<string> sseEvent in SseParser.Create(responseStream).EnumerateAsync(cancellationToken).ConfigureAwait(false))
+            {
+                // Track event ID and retry interval for resumability
+                if (!string.IsNullOrEmpty(sseEvent.EventId))
+                {
+                    state.LastEventId = sseEvent.EventId;
+                }
+                if (sseEvent.ReconnectionInterval.HasValue)
+                {
+                    state.RetryInterval = sseEvent.ReconnectionInterval.Value;
+                }
+
+                // Skip events with empty data
+                if (string.IsNullOrEmpty(sseEvent.Data))
+                {
+                    continue;
+                }
+
+                var rpcResponseOrError = await ProcessMessageAsync(sseEvent.Data, relatedRpcRequest, cancellationToken).ConfigureAwait(false);
+                if (rpcResponseOrError is not null)
+                {
+                    return new() { Response = rpcResponseOrError };
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException)
+        {
+            state.StreamEndedTimestamp = Stopwatch.GetTimestamp();
+            return new() { IsNetworkError = true };
+        }
+
+        state.StreamEndedTimestamp = Stopwatch.GetTimestamp();
+        return default;
     }
 
     private async Task<JsonRpcMessageWithId?> ProcessMessageAsync(string data, JsonRpcRequest? relatedRpcRequest, CancellationToken cancellationToken)
@@ -292,16 +429,22 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
         HttpRequestHeaders headers,
         IDictionary<string, string>? additionalHeaders,
         string? sessionId,
-        string? protocolVersion)
+        string? protocolVersion,
+        string? lastEventId = null)
     {
         if (sessionId is not null)
         {
-            headers.Add("Mcp-Session-Id", sessionId);
+            headers.Add(McpHttpHeaders.SessionId, sessionId);
         }
 
         if (protocolVersion is not null)
         {
-            headers.Add("MCP-Protocol-Version", protocolVersion);
+            headers.Add(McpHttpHeaders.ProtocolVersion, protocolVersion);
+        }
+
+        if (lastEventId is not null)
+        {
+            headers.Add(McpHttpHeaders.LastEventId, lastEventId);
         }
 
         if (additionalHeaders is null)
@@ -316,5 +459,125 @@ internal sealed partial class StreamableHttpClientSessionTransport : TransportBa
                 throw new InvalidOperationException($"Failed to add header '{header.Key}' with value '{header.Value}' from {nameof(HttpClientTransportOptions.AdditionalHeaders)}.");
             }
         }
+    }
+
+    /// <summary>
+    /// Adds standard MCP request headers (Mcp-Method, Mcp-Name) and custom parameter headers
+    /// (Mcp-Param-{Name}) to an HTTP request based on the JSON-RPC message being sent.
+    /// </summary>
+    internal static void AddMcpRequestHeaders(HttpRequestHeaders headers, JsonRpcMessage message)
+    {
+        string? method = message switch
+        {
+            JsonRpcRequest request => request.Method,
+            JsonRpcNotification notification => notification.Method,
+            _ => null,
+        };
+
+        if (method is null)
+        {
+            return;
+        }
+
+        headers.Add(McpHttpHeaders.Method, method);
+
+        // Add Mcp-Name header for methods that target a specific named resource
+        string? name = message switch
+        {
+            JsonRpcRequest { Method: RequestMethods.ToolsCall or RequestMethods.PromptsGet } request
+                => GetParamsStringProperty(request.Params, "name"),
+            JsonRpcRequest { Method: RequestMethods.ResourcesRead } request
+                => GetParamsStringProperty(request.Params, "uri"),
+            _ => null,
+        };
+
+        if (name is not null)
+        {
+            headers.Add(McpHttpHeaders.Name, name);
+        }
+
+        // Add custom Mcp-Param-{Name} headers for tools/call requests with x-mcp-header annotations
+        if (method == RequestMethods.ToolsCall &&
+            message is JsonRpcRequest toolsCallRequest &&
+            toolsCallRequest.Context?.Items?.TryGetValue(McpHttpHeaders.ToolContextKey, out var toolObj) == true &&
+            toolObj is Tool tool)
+        {
+            var arguments = GetParamsArguments(toolsCallRequest.Params);
+            McpHeaderExtractor.AddParameterHeaders(headers, tool, arguments);
+        }
+    }
+
+    /// <summary>
+    /// Extracts a string property from the JSON-RPC params object.
+    /// </summary>
+    private static string? GetParamsStringProperty(JsonNode? paramsNode, string propertyName)
+    {
+        if (paramsNode is JsonObject obj && obj.TryGetPropertyValue(propertyName, out var value))
+        {
+            return value?.GetValue<string>();
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Extracts the arguments property from a tools/call params object as a JsonElement.
+    /// </summary>
+    private static JsonElement? GetParamsArguments(JsonNode? paramsNode)
+    {
+        if (paramsNode is JsonObject obj && obj.TryGetPropertyValue("arguments", out var argsNode) && argsNode is not null)
+        {
+            return JsonSerializer.Deserialize<JsonElement>(argsNode, McpJsonUtilities.JsonContext.Default.JsonElement);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Tracks state across SSE stream connections.
+    /// </summary>
+    private sealed class SseStreamState
+    {
+        public string? LastEventId { get; set; }
+        public TimeSpan? RetryInterval { get; set; }
+        /// <summary>Timestamp (via Stopwatch.GetTimestamp()) when the last SSE stream ended, used to discount processing overhead from the retry delay.</summary>
+        public long StreamEndedTimestamp { get; set; }
+    }
+
+    /// <summary>
+    /// Represents the result of processing an SSE response.
+    /// </summary>
+    private readonly struct SseResponse
+    {
+        public JsonRpcMessageWithId? Response { get; init; }
+        public bool IsNetworkError { get; init; }
+    }
+
+    private static TimeSpan ElapsedSince(long stopwatchTimestamp)
+    {
+#if NET
+        return Stopwatch.GetElapsedTime(stopwatchTimestamp);
+#else
+        return TimeSpan.FromSeconds((double)(Stopwatch.GetTimestamp() - stopwatchTimestamp) / Stopwatch.Frequency);
+#endif
+    }
+
+    private void SetSessionExpired()
+    {
+        // Store the error before canceling so DisposeAsync can use it if it races us, especially
+        // after the call to Cancel below, to invoke SetDisconnected.
+        _disconnectError = new ClientTransportClosedException(new HttpClientCompletionDetails
+        {
+            HttpStatusCode = HttpStatusCode.NotFound,
+            Exception = new McpException(
+                "The server returned HTTP 404 for a request with an Mcp-Session-Id, indicating the session has expired. " +
+                "To continue, create a new client session or call ResumeSessionAsync with a new connection."),
+        });
+
+        // Cancel to unblock any in-flight operations (e.g., SSE stream reads in
+        // SendGetSseRequestWithRetriesAsync) that are waiting on _connectionCts.Token.
+        _connectionCts.Cancel();
+
+        SetDisconnected(_disconnectError);
     }
 }

@@ -12,7 +12,7 @@ namespace ModelContextProtocol.Protocol;
 /// but is not serialized as part of the JSON-RPC payload. This includes transport references, execution context,
 /// and authenticated user information.
 /// </remarks>
-public class JsonRpcMessageContext
+public sealed class JsonRpcMessageContext
 {
     /// <summary>
     /// Gets or sets the transport the <see cref="JsonRpcMessage"/> was received on or should be sent over.
@@ -25,7 +25,7 @@ public class JsonRpcMessageContext
     public ITransport? RelatedTransport { get; set; }
 
     /// <summary>
-    /// Gets or sets the <see cref="ExecutionContext"/> that should be used to run any handlers
+    /// Gets or sets the <see cref="ExecutionContext"/> that should be used to run any handlers.
     /// </summary>
     /// <remarks>
     /// This property is used to support the Streamable HTTP transport in its default stateful mode. In this mode,
@@ -58,4 +58,20 @@ public class JsonRpcMessageContext
     /// </para>
     /// </remarks>
     public ClaimsPrincipal? User { get; set; }
+
+    /// <summary>
+    /// Gets or sets a key/value collection that can be used to share data within the scope of this message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This property allows data to be flowed throughout the message processing pipeline,
+    /// including from incoming message filters to request-specific filters and handlers.
+    /// </para>
+    /// <para>
+    /// When creating a <see cref="MessageContext"/> or <see cref="RequestContext{TParams}"/> for server-side
+    /// processing, the Items dictionary from this context will be used, ensuring data set in message filters
+    /// is available in request filters and handlers.
+    /// </para>
+    /// </remarks>
+    public IDictionary<string, object?>? Items { get; set; }
 }

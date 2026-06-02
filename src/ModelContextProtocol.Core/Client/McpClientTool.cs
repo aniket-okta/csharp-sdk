@@ -1,6 +1,5 @@
 using Microsoft.Extensions.AI;
 using ModelContextProtocol.Protocol;
-using System.Collections.ObjectModel;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -26,13 +25,6 @@ namespace ModelContextProtocol.Client;
 /// </remarks>
 public sealed class McpClientTool : AIFunction
 {
-    /// <summary>Additional properties exposed from tools.</summary>
-    private static readonly ReadOnlyDictionary<string, object?> s_additionalProperties =
-        new(new Dictionary<string, object?>()
-        {
-            ["Strict"] = false, // some MCP schemas may not meet "strict" requirements
-        });
-
     private readonly McpClient _client;
     private readonly string _name;
     private readonly string _description;
@@ -127,9 +119,6 @@ public sealed class McpClientTool : AIFunction
     public override JsonSerializerOptions JsonSerializerOptions { get; }
 
     /// <inheritdoc/>
-    public override IReadOnlyDictionary<string, object?> AdditionalProperties => s_additionalProperties;
-
-    /// <inheritdoc/>
     protected async override ValueTask<object?> InvokeCoreAsync(
         AIFunctionArguments arguments, CancellationToken cancellationToken)
     {
@@ -150,10 +139,10 @@ public sealed class McpClientTool : AIFunction
         {
             switch (result.Content.Count)
             {
-                case 1 when result.Content[0].ToAIContent() is { } aiContent:
+                case 1 when result.Content[0].ToAIContent(JsonSerializerOptions) is { } aiContent:
                     return aiContent;
 
-                case > 1 when result.Content.Select(c => c.ToAIContent()).ToArray() is { } aiContents && aiContents.All(static c => c is not null):
+                case > 1 when result.Content.Select(c => c.ToAIContent(JsonSerializerOptions)).ToArray() is { } aiContents && aiContents.All(static c => c is not null):
                     return aiContents;
             }
         }
@@ -182,9 +171,9 @@ public sealed class McpClientTool : AIFunction
     /// </returns>
     /// <remarks>
     /// The base <see cref="AIFunction.InvokeAsync"/> method is overridden to invoke this <see cref="CallAsync"/> method.
-    /// The only difference in behavior is that <see cref="AIFunction.InvokeAsync"/> serializes the resulting <see cref="CallToolResult"/>"/>
+    /// The only difference in behavior is that <see cref="AIFunction.InvokeAsync"/> serializes the resulting <see cref="CallToolResult"/>
     /// such that the <see cref="object"/> returned is a <see cref="JsonElement"/> containing the serialized <see cref="CallToolResult"/>.
-    /// This <see cref="CallToolResult"/> method is intended to be called directly by user code, whereas the base <see cref="AIFunction.InvokeAsync"/>
+    /// This <see cref="CallAsync"/> method is intended to be called directly by user code, whereas the base <see cref="AIFunction.InvokeAsync"/>
     /// is intended to be used polymorphically via the base class, typically as part of an <see cref="IChatClient"/> operation.
     /// </remarks>
     /// <exception cref="McpException">The server could not find the requested tool, or the server encountered an error while processing the request.</exception>
@@ -258,7 +247,6 @@ public sealed class McpClientTool : AIFunction
     /// the value returned from this instance's <see cref="AITool.Name"/>.
     /// </para>
     /// </remarks>
-    /// <returns>A new instance of <see cref="McpClientTool"/> with the provided name.</returns>
     public McpClientTool WithName(string name) =>
         new(_client, ProtocolTool, JsonSerializerOptions, name, _description, _progress, _meta);
 

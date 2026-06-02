@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Serialization;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Server;
@@ -66,4 +67,57 @@ public sealed class ClientCapabilities
     /// </summary>
     [JsonPropertyName("elicitation")]
     public ElicitationCapability? Elicitation { get; set; }
+
+    /// <summary>
+    /// Gets or sets the client's tasks capability for supporting task-augmented requests.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The tasks capability enables servers to augment their requests with tasks for long-running
+    /// operations. When present, servers can request that certain operations (like sampling or
+    /// elicitation) execute asynchronously, with the ability to poll for status and retrieve results later.
+    /// </para>
+    /// <para>
+    /// See <see cref="McpTasksCapability"/> for details on configuring which operations support tasks.
+    /// </para>
+    /// </remarks>
+    [Experimental(Experimentals.Tasks_DiagnosticId, UrlFormat = Experimentals.Tasks_Url)]
+    [JsonIgnore]
+    public McpTasksCapability? Tasks
+    {
+        get => TasksCore;
+        set => TasksCore = value;
+    }
+
+    // See ExperimentalInternalPropertyTests.cs before modifying this property.
+    [JsonInclude]
+    [JsonPropertyName("tasks")]
+    internal McpTasksCapability? TasksCore { get; set; }
+
+    /// <summary>
+    /// Gets or sets optional MCP extensions that the client supports.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Keys are extension identifiers in reverse domain notation with an extension name
+    /// (e.g., <c>"io.modelcontextprotocol/oauth-client-credentials"</c>), and values are
+    /// per-extension settings objects. An empty object indicates support with no additional settings.
+    /// </para>
+    /// <para>
+    /// Extensions provide a framework for extending the Model Context Protocol while maintaining
+    /// interoperability. Clients advertise extension support via this field during the initialization handshake.
+    /// </para>
+    /// </remarks>
+    [Experimental(Experimentals.Extensions_DiagnosticId, UrlFormat = Experimentals.Extensions_Url)]
+    [JsonIgnore]
+    public IDictionary<string, object>? Extensions
+    {
+        get => ExtensionsCore;
+        set => ExtensionsCore = value;
+    }
+
+    // See ExperimentalInternalPropertyTests.cs before modifying this property.
+    [JsonInclude]
+    [JsonPropertyName("extensions")]
+    internal IDictionary<string, object>? ExtensionsCore { get; set; }
 }

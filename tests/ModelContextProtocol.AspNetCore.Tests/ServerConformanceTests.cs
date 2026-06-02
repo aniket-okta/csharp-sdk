@@ -1,15 +1,17 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using ModelContextProtocol.Tests.Utils;
 
 namespace ModelContextProtocol.ConformanceTests;
 
 /// <summary>
-/// Runs the official MCP conformance tests against the ConformanceServer.
-/// This test starts the ConformanceServer, runs the Node.js-based conformance test suite,
-/// and reports the results.
+/// Shared fixture that starts a single ConformanceServer instance for all tests in
+/// <see cref="ServerConformanceTests"/>. This avoids TCP port TIME_WAIT conflicts
+/// that occur when each test starts and stops its own server on the same port.
 /// </summary>
-public class ServerConformanceTests : IAsyncLifetime
+public class ConformanceServerFixture : IAsyncLifetime
 {
     // Use different ports for each target framework to allow parallel execution
     // net10.0 -> 3001, net9.0 -> 3002, net8.0 -> 3003
@@ -27,35 +29,27 @@ public class ServerConformanceTests : IAsyncLifetime
         };
     }
 
-    private readonly int _serverPort = GetPortForTargetFramework();
-    private readonly string _serverUrl;
-    private readonly ITestOutputHelper _output;
     private Task? _serverTask;
     private CancellationTokenSource? _serverCts;
 
-    public ServerConformanceTests(ITestOutputHelper output)
-    {
-        _output = output;
-        _serverUrl = $"http://localhost:{_serverPort}";
-    }
+    public string ServerUrl { get; } = $"http://localhost:{GetPortForTargetFramework()}";
 
     public async ValueTask InitializeAsync()
     {
-        // Start the ConformanceServer
-        StartConformanceServer();
+        _serverCts = new CancellationTokenSource();
+        _serverTask = Task.Run(() => ConformanceServer.Program.MainAsync(
+            ["--urls", ServerUrl], cancellationToken: _serverCts.Token));
 
         // Wait for server to be ready (retry for up to 30 seconds)
         var timeout = TimeSpan.FromSeconds(30);
         var stopwatch = Stopwatch.StartNew();
-        using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        using var httpClient = new HttpClient { Timeout = TestConstants.HttpClientPollingTimeout };
 
         while (stopwatch.Elapsed < timeout)
         {
             try
             {
-                // Try to connect to the health endpoint
-                await httpClient.GetAsync($"{_serverUrl}/health");
-                // Any response (even an error) means the server is up
+                await httpClient.GetAsync($"{ServerUrl}/health");
                 return;
             }
             catch (HttpRequestException)
@@ -75,7 +69,6 @@ public class ServerConformanceTests : IAsyncLifetime
 
     public async ValueTask DisposeAsync()
     {
-        // Stop the server
         if (_serverCts != null)
         {
             _serverCts.Cancel();
@@ -83,7 +76,7 @@ public class ServerConformanceTests : IAsyncLifetime
             {
                 try
                 {
-                    await _serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+                    await _serverTask.WaitAsync(TestConstants.DefaultTimeout);
                 }
                 catch
                 {
@@ -93,117 +86,169 @@ public class ServerConformanceTests : IAsyncLifetime
             _serverCts.Dispose();
         }
     }
+}
 
+/// <summary>
+/// Runs the official MCP conformance tests against the ConformanceServer.
+/// Uses a shared <see cref="ConformanceServerFixture"/> so the server is started once
+/// and reused across all tests, avoiding TCP port conflicts on Windows.
+/// </summary>
+public class ServerConformanceTests(ConformanceServerFixture fixture, ITestOutputHelper output)
+    : IClassFixture<ConformanceServerFixture>
+{
     [Fact]
     public async Task RunConformanceTests()
     {
-        // Check if Node.js is installed
-        Assert.SkipWhen(!IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
+        Assert.SkipWhen(!NodeHelpers.IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
 
-        // Run the conformance test suite
-        var result = await RunNpxConformanceTests();
+        var result = await RunConformanceTestsAsync($"server --url {fixture.ServerUrl}");
 
-        // Report the results
         Assert.True(result.Success,
             $"Conformance tests failed.\n\nStdout:\n{result.Output}\n\nStderr:\n{result.Error}");
     }
 
-    private void StartConformanceServer()
+    [Fact]
+    public async Task RunPendingConformanceTest_JsonSchema202012()
     {
-        // The ConformanceServer binary is in a parallel directory to the test binary
-        // Test binary is in: artifacts/bin/ModelContextProtocol.ConformanceTests/Debug/{tfm}/
-        // ConformanceServer binary is in: artifacts/bin/ModelContextProtocol.ConformanceServer/Debug/{tfm}/
-        var testBinaryDir = AppContext.BaseDirectory; // e.g., .../net10.0/
-        var configuration = Path.GetFileName(Path.GetDirectoryName(testBinaryDir.TrimEnd(Path.DirectorySeparatorChar))!);
-        var targetFramework = Path.GetFileName(testBinaryDir.TrimEnd(Path.DirectorySeparatorChar));
-        var conformanceServerDir = Path.GetFullPath(
-            Path.Combine(testBinaryDir, "..", "..", "..", "ModelContextProtocol.ConformanceServer", configuration, targetFramework));
+        Assert.SkipWhen(!NodeHelpers.IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
+        Assert.SkipWhen(
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+            "Pending Node-based conformance scenario is unstable on Windows due to a libuv shutdown assertion.");
 
-        if (!Directory.Exists(conformanceServerDir))
-        {
-            throw new DirectoryNotFoundException(
-                $"ConformanceServer directory not found at: {conformanceServerDir}");
-        }
+        var result = await RunConformanceTestsAsync($"server --url {fixture.ServerUrl} --scenario json-schema-2020-12");
 
-        // Start the server in a background task
-        _serverCts = new CancellationTokenSource();
-        _serverTask = Task.Run(() => ConformanceServer.Program.MainAsync(["--urls", _serverUrl], new XunitLoggerProvider(_output), cancellationToken: _serverCts.Token));
+        Assert.True(result.Success,
+            $"Conformance test failed.\n\nStdout:\n{result.Output}\n\nStderr:\n{result.Error}");
     }
 
-    private async Task<(bool Success, string Output, string Error)> RunNpxConformanceTests()
+    [Fact]
+    public async Task RunPendingConformanceTest_ServerSsePolling()
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = "npx",
-            Arguments = $"-y @modelcontextprotocol/conformance server --url {_serverUrl}",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
+        Assert.SkipWhen(!NodeHelpers.IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
+        Assert.SkipWhen(
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+            "Pending Node-based conformance scenario is unstable on Windows due to a libuv shutdown assertion.");
+
+        var result = await RunConformanceTestsAsync($"server --url {fixture.ServerUrl} --scenario server-sse-polling");
+
+        Assert.True(result.Success,
+            $"Conformance test failed.\n\nStdout:\n{result.Output}\n\nStderr:\n{result.Error}");
+    }
+
+    [Fact]
+    public async Task RunConformanceTest_HttpHeaderValidation()
+    {
+        Assert.SkipWhen(!NodeHelpers.IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
+        Assert.SkipWhen(!NodeHelpers.HasSep2243Scenarios(), "SEP-2243 conformance scenarios not yet available.");
+
+        var result = await RunConformanceTestsAsync($"server --url {fixture.ServerUrl} --scenario http-header-validation");
+
+        Assert.True(result.Success,
+            $"Conformance test failed.\n\nStdout:\n{result.Output}\n\nStderr:\n{result.Error}");
+    }
+
+    [Fact]
+    public async Task RunConformanceTest_HttpCustomHeaderServerValidation()
+    {
+        Assert.SkipWhen(!NodeHelpers.IsNodeInstalled(), "Node.js is not installed. Skipping conformance tests.");
+        Assert.SkipWhen(!NodeHelpers.HasSep2243Scenarios(), "SEP-2243 conformance scenarios not yet available.");
+
+        var result = await RunConformanceTestsAsync($"server --url {fixture.ServerUrl} --scenario http-custom-header-server-validation");
+
+        Assert.True(result.Success,
+            $"Conformance test failed.\n\nStdout:\n{result.Output}\n\nStderr:\n{result.Error}");
+    }
+
+    private async Task<(bool Success, string Output, string Error)> RunConformanceTestsAsync(string arguments)
+    {
+        var startInfo = NodeHelpers.ConformanceTestStartInfo(arguments);
 
         var outputBuilder = new StringBuilder();
         var errorBuilder = new StringBuilder();
 
         var process = new Process { StartInfo = startInfo };
 
-        process.OutputDataReceived += (sender, e) =>
+        // Protect callbacks with try/catch to prevent ITestOutputHelper from
+        // throwing on a background thread if events arrive after the test completes.
+        DataReceivedEventHandler outputHandler = (sender, e) =>
         {
             if (e.Data != null)
             {
-                _output.WriteLine(e.Data);
+                try { output.WriteLine(e.Data); } catch { }
                 outputBuilder.AppendLine(e.Data);
             }
         };
 
-        process.ErrorDataReceived += (sender, e) =>
+        DataReceivedEventHandler errorHandler = (sender, e) =>
         {
             if (e.Data != null)
             {
-                _output.WriteLine(e.Data);
+                try { output.WriteLine(e.Data); } catch { }
                 errorBuilder.AppendLine(e.Data);
             }
         };
+
+        process.OutputDataReceived += outputHandler;
+        process.ErrorDataReceived += errorHandler;
 
         process.Start();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
-        await process.WaitForExitAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        try
+        {
+            await process.WaitForExitAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            process.Kill(entireProcessTree: true);
+            process.OutputDataReceived -= outputHandler;
+            process.ErrorDataReceived -= errorHandler;
+            return (
+                Success: false,
+                Output: outputBuilder.ToString(),
+                Error: errorBuilder.ToString() + "\nProcess timed out after 5 minutes and was killed."
+            );
+        }
+
+        process.OutputDataReceived -= outputHandler;
+        process.ErrorDataReceived -= errorHandler;
+
+        var stdoutText = outputBuilder.ToString();
+        var stderrText = errorBuilder.ToString();
+
+        // The Node.js conformance runner can crash during cleanup on Windows with a libuv
+        // assertion ("!(handle->flags & UV_HANDLE_CLOSING)") that produces a non-zero exit
+        // code even though every conformance check passed. When that happens, fall back to
+        // parsing the "Test Results:" summary in stdout to decide success.
+        bool success = process.ExitCode == 0 || ConformanceOutputIndicatesSuccess(stdoutText);
 
         return (
-            Success: process.ExitCode == 0,
-            Output: outputBuilder.ToString(),
-            Error: errorBuilder.ToString()
+            Success: success,
+            Output: stdoutText,
+            Error: stderrText
         );
     }
 
-    private static bool IsNodeInstalled()
+    /// <summary>
+    /// Parses the conformance runner output for a "Test Results:" line such as
+    /// "Passed: 3/3, 0 failed, 0 warnings" and returns true when all checks passed
+    /// and none failed.
+    /// </summary>
+    private static bool ConformanceOutputIndicatesSuccess(string output)
     {
-        try
-        {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "npx",   // Check specifically for npx because windows seems unable to find it
-                Arguments = "--version",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = Process.Start(startInfo);
-            if (process == null)
-            {
-                return false;
-            }
-
-            process.WaitForExit(5000);
-            return process.ExitCode == 0;
-        }
-        catch
+        // Match lines like "Passed: 3/3, 0 failed, 0 warnings"
+        var match = Regex.Match(output, @"Passed:\s*(\d+)/(\d+),\s*(\d+)\s*failed");
+        if (!match.Success)
         {
             return false;
         }
+
+        int passed = int.Parse(match.Groups[1].Value);
+        int total = int.Parse(match.Groups[2].Value);
+        int failed = int.Parse(match.Groups[3].Value);
+
+        return passed == total && failed == 0 && total > 0;
     }
 }

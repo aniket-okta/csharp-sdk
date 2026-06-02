@@ -1,6 +1,7 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Protocol;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 
 namespace ModelContextProtocol.Server;
@@ -57,7 +58,7 @@ namespace ModelContextProtocol.Server;
 ///       When the <see cref="McpServerTool"/> is constructed, it may be passed an <see cref="IServiceProvider"/> via
 ///       <see cref="McpServerToolCreateOptions.Services"/>. Any parameter that can be satisfied by that <see cref="IServiceProvider"/>
 ///       according to <see cref="IServiceProviderIsService"/> will not be included in the generated JSON schema and will be resolved
-///       from the <see cref="IServiceProvider"/> provided to when the tool is invoked rather than from the argument collection.
+///       from the <see cref="IServiceProvider"/> provided when the tool is invoked rather than from the argument collection.
 ///     </description>
 ///   </item>
 ///   <item>
@@ -81,6 +82,26 @@ namespace ModelContextProtocol.Server;
 /// to provide data to the method.
 /// </para>
 /// <para>
+/// The tool method is responsible for validating its own input arguments (e.g., checking required fields, value ranges, string lengths, or
+/// any other business rules). Data annotations such as <c>RequiredAttribute</c> and
+/// <c>MaxLengthAttribute</c> on parameter types influence the generated JSON schema exposed
+/// to clients, but they are not enforced at runtime by the SDK. Validation should be performed explicitly within the tool method.
+/// </para>
+/// <para>
+/// To signal an error (including validation failures) back to the client, either throw an <see cref="McpException"/>
+/// or return a <see cref="CallToolResult"/> with <see cref="CallToolResult.IsError"/> set to <see langword="true"/>.
+/// When a tool throws an <see cref="McpException"/>, its <see cref="Exception.Message"/> is included in the error result
+/// sent to the client. Throwing any other exception type also results in an error <see cref="CallToolResult"/>, but with
+/// a generic error message (to avoid leaking sensitive information). Alternatively, a tool can declare a return type of
+/// <see cref="CallToolResult"/> to have full control over both success and error responses.
+/// </para>
+/// <para>
+/// It is important to provide clear <see cref="System.ComponentModel.DescriptionAttribute"/> values on tool methods and their parameters.
+/// These descriptions are surfaced to AI models and help them determine when and how to use the tool, what values to pass for each parameter,
+/// and what constraints the parameters have. Well-written descriptions reduce incorrect tool invocations and improve the quality of
+/// model interactions.
+/// </para>
+/// <para>
 /// Return values from a method are used to create the <see cref="CallToolResult"/> that is sent back to the client:
 /// </para>
 /// <list type="table">
@@ -90,7 +111,7 @@ namespace ModelContextProtocol.Server;
 ///   </item>
 ///   <item>
 ///     <term><see cref="AIContent"/></term>
-///     <description>Converted to a single <see cref="ContentBlock"/> object using <see cref="AIContentExtensions.ToContentBlock(AIContent)"/>.</description>
+///     <description>Converted to a single <see cref="ContentBlock"/> object using <see cref="AIContentExtensions.ToContentBlock(AIContent, JsonSerializerOptions)"/>.</description>
 ///   </item>
 ///   <item>
 ///     <term><see cref="string"/></term>
@@ -106,7 +127,7 @@ namespace ModelContextProtocol.Server;
 ///   </item>
 ///   <item>
 ///     <term><see cref="IEnumerable{AIContent}"/> of <see cref="AIContent"/></term>
-///     <description>Each <see cref="AIContent"/> is converted to a <see cref="ContentBlock"/> object using <see cref="AIContentExtensions.ToContentBlock(AIContent)"/>.</description>
+///     <description>Each <see cref="AIContent"/> is converted to a <see cref="ContentBlock"/> object using <see cref="AIContentExtensions.ToContentBlock(AIContent, JsonSerializerOptions)"/>.</description>
 ///   </item>
 ///   <item>
 ///     <term><see cref="IEnumerable{Content}"/> of <see cref="ContentBlock"/></term>
@@ -136,6 +157,7 @@ public sealed class McpServerToolAttribute : Attribute
     internal bool? _idempotent;
     internal bool? _openWorld;
     internal bool? _readOnly;
+    internal ToolTaskSupport? _taskSupport;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="McpServerToolAttribute"/> class.
@@ -244,6 +266,27 @@ public sealed class McpServerToolAttribute : Attribute
     public bool UseStructuredContent { get; set; }
 
     /// <summary>
+    /// Gets or sets a <see cref="Type"/> from which to generate the tool's output schema.
+    /// </summary>
+    /// <value>
+    /// The default is <see langword="null"/>, which means the output schema is inferred from the return type.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// When set, a JSON schema is generated from the specified <see cref="Type"/> and used as the
+    /// <see cref="Tool.OutputSchema"/> instead of the schema inferred from the tool method's return type.
+    /// This is particularly useful when a tool method returns <see cref="CallToolResult"/> directly
+    /// (to control properties like <see cref="Result.Meta"/>, <see cref="CallToolResult.IsError"/>,
+    /// or <see cref="CallToolResult.StructuredContent"/>) but still needs to advertise a meaningful output
+    /// schema to clients.
+    /// </para>
+    /// <para>
+    /// <see cref="UseStructuredContent"/> must also be set to <see langword="true"/> for this property to take effect.
+    /// </para>
+    /// </remarks>
+    public Type? OutputSchemaType { get; set; }
+
+    /// <summary>
     /// Gets or sets the source URI for the tool's icon.
     /// </summary>
     /// <remarks>
@@ -257,4 +300,29 @@ public sealed class McpServerToolAttribute : Attribute
     /// </para>
     /// </remarks>
     public string? IconSource { get; set; }
+
+    /// <summary>
+    /// Gets or sets the task support configuration for the tool.
+    /// </summary>
+    /// <value>
+    /// A <see cref="ToolTaskSupport"/> value indicating how the tool supports task-based invocation.
+    /// The default value is <see cref="ToolTaskSupport.Forbidden"/>.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// When set to <see cref="ToolTaskSupport.Forbidden"/>, clients must not attempt to invoke the tool as a task.
+    /// When set to <see cref="ToolTaskSupport.Optional"/>, clients may invoke the tool as a task or as a normal request.
+    /// When set to <see cref="ToolTaskSupport.Required"/>, clients must invoke the tool as a task.
+    /// </para>
+    /// <para>
+    /// If this property is not explicitly set on the attribute, the task support behavior will be determined 
+    /// automatically based on the tool's characteristics (e.g., async methods default to <see cref="ToolTaskSupport.Optional"/>).
+    /// </para>
+    /// </remarks>
+    [Experimental(Experimentals.Tasks_DiagnosticId, UrlFormat = Experimentals.Tasks_Url)]
+    public ToolTaskSupport TaskSupport
+    {
+        get => _taskSupport ?? ToolTaskSupport.Forbidden;
+        set => _taskSupport = value;
+    }
 }

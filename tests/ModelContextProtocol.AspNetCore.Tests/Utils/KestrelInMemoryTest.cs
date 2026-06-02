@@ -7,7 +7,7 @@ using ModelContextProtocol.Tests.Utils;
 
 namespace ModelContextProtocol.AspNetCore.Tests.Utils;
 
-public class KestrelInMemoryTest : LoggedTest
+public abstract class KestrelInMemoryTest : LoggedTest
 {
     public KestrelInMemoryTest(ITestOutputHelper testOutputHelper)
         : base(testOutputHelper)
@@ -27,20 +27,23 @@ public class KestrelInMemoryTest : LoggedTest
             return new(connection.ClientStream);
         };
 
-        HttpClient = new HttpClient(SocketsHttpHandler)
-        {
-            BaseAddress = new Uri("http://localhost:5000/"),
-            Timeout = TimeSpan.FromSeconds(10),
-        };
+        HttpClient = new HttpClient(SocketsHttpHandler);
+        ConfigureHttpClient(HttpClient);
     }
 
     public WebApplicationBuilder Builder { get; }
 
-    public HttpClient HttpClient { get; }
+    public HttpClient HttpClient { get; set; }
 
     public SocketsHttpHandler SocketsHttpHandler { get; } = new();
 
     public KestrelInMemoryTransport KestrelInMemoryTransport { get; } = new();
+
+    protected static void ConfigureHttpClient(HttpClient httpClient)
+    {
+        httpClient.BaseAddress = new Uri("http://localhost:5000/");
+        httpClient.Timeout = TestConstants.HttpClientTimeout;
+    }
 
     public override void Dispose()
     {

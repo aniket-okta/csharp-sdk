@@ -124,6 +124,12 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             Icons = options?.Icons,
         };
 
+        // Add x-mcp-header extensions to the input schema based on McpHeaderAttribute on parameters
+        if (function.UnderlyingMethod is { } method)
+        {
+            tool.InputSchema = AddMcpHeaderExtensions(tool.InputSchema, method);
+        }
+
         if (options is not null)
         {
             if (options.Title is not null ||
@@ -148,6 +154,23 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             tool.Meta = function.UnderlyingMethod is not null ?
                 CreateMetaFromAttributes(function.UnderlyingMethod, options.Meta) :
                 options.Meta;
+
+            // Apply user-specified Execution settings if provided
+            if (options.Execution is not null)
+            {
+                tool.Execution = options.Execution;
+            }
+        }
+
+        // Auto-detect async methods and mark with taskSupport = "optional" unless explicitly configured.
+        // This enables implicit task support for async tools: clients can choose to invoke them
+        // synchronously (wait for completion) or as a task (receive taskId, poll for result).
+        if (function.UnderlyingMethod is not null && 
+            IsAsyncMethod(function.UnderlyingMethod) &&
+            tool.Execution?.TaskSupport is null)
+        {
+            tool.Execution ??= new ToolExecution();
+            tool.Execution.TaskSupport = ToolTaskSupport.Optional;
         }
 
         return new AIFunctionMcpServerTool(function, tool, options?.Services, structuredOutputRequiresWrapping, options?.Metadata ?? []);
@@ -188,6 +211,19 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             }
 
             newOptions.UseStructuredContent = toolAttr.UseStructuredContent;
+
+            if (toolAttr.OutputSchemaType is Type outputSchemaType)
+            {
+                newOptions.OutputSchema ??= AIJsonUtilities.CreateJsonSchema(outputSchemaType,
+                    serializerOptions: newOptions.SerializerOptions ?? McpJsonUtilities.DefaultOptions,
+                    inferenceOptions: newOptions.SchemaCreateOptions);
+            }
+
+            if (toolAttr._taskSupport is { } taskSupport)
+            {
+                newOptions.Execution ??= new ToolExecution();
+                newOptions.Execution.TaskSupport ??= taskSupport;
+            }
         }
 
         if (method.GetCustomAttribute<DescriptionAttribute>() is { } descAttr)
@@ -211,7 +247,6 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
 
         AIFunction = function;
         ProtocolTool = tool;
-        ProtocolTool.McpServerTool = this;
 
         _structuredOutputRequiresWrapping = structuredOutputRequiresWrapping;
         _metadata = metadata;
@@ -244,7 +279,7 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
         object? result;
         result = await AIFunction.InvokeAsync(arguments, cancellationToken).ConfigureAwait(false);
 
-        JsonNode? structuredContent = CreateStructuredResponse(result);
+        JsonElement? structuredContent = CreateStructuredResponse(result);
         return result switch
         {
             AIContent aiContent => new()
@@ -315,27 +350,27 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
 
         // Case the name based on the provided naming policy.
         return (policy ?? JsonNamingPolicy.SnakeCaseLower).ConvertName(name) ?? name;
+    }
 
-        static bool IsAsyncMethod(MethodInfo method)
+    private static bool IsAsyncMethod(MethodInfo method)
+    {
+        Type t = method.ReturnType;
+
+        if (t == typeof(Task) || t == typeof(ValueTask))
         {
-            Type t = method.ReturnType;
+            return true;
+        }
 
-            if (t == typeof(Task) || t == typeof(ValueTask))
+        if (t.IsGenericType)
+        {
+            t = t.GetGenericTypeDefinition();
+            if (t == typeof(Task<>) || t == typeof(ValueTask<>) || t == typeof(IAsyncEnumerable<>))
             {
                 return true;
             }
-
-            if (t.IsGenericType)
-            {
-                t = t.GetGenericTypeDefinition();
-                if (t == typeof(Task<>) || t == typeof(ValueTask<>) || t == typeof(IAsyncEnumerable<>))
-                {
-                    return true;
-                }
-            }
-
-            return false;
         }
+
+        return false;
     }
 
     /// <summary>Creates metadata from attributes on the specified method and its declaring class, with the MethodInfo as the first item.</summary>
@@ -465,7 +500,17 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             return null;
         }
 
-        if (function.ReturnJsonSchema is not JsonElement outputSchema)
+        // Explicit OutputSchema takes precedence over AIFunction's return schema.
+        JsonElement outputSchema;
+        if (toolCreateOptions.OutputSchema is { } explicitSchema)
+        {
+            outputSchema = explicitSchema;
+        }
+        else if (function.ReturnJsonSchema is { } returnSchema)
+        {
+            outputSchema = returnSchema;
+        }
+        else
         {
             return null;
         }
@@ -507,7 +552,7 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
         return outputSchema;
     }
 
-    private JsonNode? CreateStructuredResponse(object? aiFunctionResult)
+    private JsonElement? CreateStructuredResponse(object? aiFunctionResult)
     {
         if (ProtocolTool.OutputSchema is null)
         {
@@ -515,25 +560,29 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             return null;
         }
 
-        JsonNode? nodeResult = aiFunctionResult switch
+        JsonElement? elementResult = aiFunctionResult switch
         {
-            JsonNode node => node,
-            JsonElement jsonElement => JsonSerializer.SerializeToNode(jsonElement, McpJsonUtilities.JsonContext.Default.JsonElement),
-            _ => JsonSerializer.SerializeToNode(aiFunctionResult, AIFunction.JsonSerializerOptions.GetTypeInfo(typeof(object))),
+            JsonElement jsonElement => jsonElement,
+            JsonNode node => JsonSerializer.SerializeToElement(node, McpJsonUtilities.JsonContext.Default.JsonNode),
+            null => null,
+            _ => JsonSerializer.SerializeToElement(aiFunctionResult, AIFunction.JsonSerializerOptions.GetTypeInfo(typeof(object))),
         };
 
         if (_structuredOutputRequiresWrapping)
         {
-            return new JsonObject
+            JsonNode? resultNode = elementResult is { } je
+                ? JsonSerializer.SerializeToNode(je, McpJsonUtilities.JsonContext.Default.JsonElement)
+                : null;
+            return JsonSerializer.SerializeToElement(new JsonObject
             {
-                ["result"] = nodeResult
-            };
+                ["result"] = resultNode
+            }, McpJsonUtilities.JsonContext.Default.JsonObject);
         }
 
-        return nodeResult;
+        return elementResult;
     }
 
-    private static CallToolResult ConvertAIContentEnumerableToCallToolResult(IEnumerable<AIContent> contentItems, JsonNode? structuredContent)
+    private static CallToolResult ConvertAIContentEnumerableToCallToolResult(IEnumerable<AIContent> contentItems, JsonElement? structuredContent)
     {
         List<ContentBlock> contentList = [];
         bool allErrorContent = true;
@@ -556,5 +605,86 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             StructuredContent = structuredContent,
             IsError = allErrorContent && hasAny
         };
+    }
+
+    /// <summary>
+    /// Post-processes the input schema to add <c>x-mcp-header</c> extensions based on
+    /// <see cref="McpHeaderAttribute"/> on method parameters.
+    /// </summary>
+    private static JsonElement AddMcpHeaderExtensions(JsonElement inputSchema, MethodInfo method)
+    {
+        // Collect parameters with McpHeaderAttribute
+        var headerParams = new List<(string ParameterName, string HeaderName, ParameterInfo Parameter)>();
+        var headerNamesSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var param in method.GetParameters())
+        {
+            var attr = param.GetCustomAttribute<McpHeaderAttribute>();
+            if (attr is null)
+            {
+                continue;
+            }
+
+            // Validate primitive type only
+            var paramType = Nullable.GetUnderlyingType(param.ParameterType) ?? param.ParameterType;
+            if (!IsPrimitiveHeaderType(paramType))
+            {
+                throw new InvalidOperationException(
+                    $"Parameter '{param.Name}' on method '{method.Name}' has [McpHeader] but is not a primitive type. " +
+                    "Only string, numeric, and boolean types may be annotated with [McpHeader].");
+            }
+
+            // Validate case-insensitive uniqueness
+            if (!headerNamesSet.Add(attr.Name))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate x-mcp-header name '{attr.Name}' (case-insensitive) found on method '{method.Name}'. " +
+                    "Header names must be case-insensitively unique within a tool's input schema.");
+            }
+
+            headerParams.Add((param.Name!, attr.Name, param));
+        }
+
+        if (headerParams.Count == 0)
+        {
+            return inputSchema;
+        }
+
+        // Parse the schema to a mutable JsonNode, add extensions, and convert back
+        var schemaNode = JsonNode.Parse(inputSchema.GetRawText());
+        if (schemaNode is not JsonObject schemaObj ||
+            !schemaObj.TryGetPropertyValue("properties", out var propertiesNode) ||
+            propertiesNode is not JsonObject propertiesObj)
+        {
+            return inputSchema;
+        }
+
+        foreach (var (parameterName, headerName, _) in headerParams)
+        {
+            if (propertiesObj.TryGetPropertyValue(parameterName, out var propNode) &&
+                propNode is JsonObject propObj)
+            {
+                propObj["x-mcp-header"] = headerName;
+            }
+        }
+
+        return JsonSerializer.Deserialize(schemaNode, McpJsonUtilities.JsonContext.Default.JsonElement);
+    }
+
+    private static bool IsPrimitiveHeaderType(Type type)
+    {
+        return type == typeof(string) ||
+               type == typeof(bool) ||
+               type == typeof(byte) ||
+               type == typeof(sbyte) ||
+               type == typeof(short) ||
+               type == typeof(ushort) ||
+               type == typeof(int) ||
+               type == typeof(uint) ||
+               type == typeof(long) ||
+               type == typeof(ulong) ||
+               type == typeof(float) ||
+               type == typeof(double) ||
+               type == typeof(decimal);
     }
 }

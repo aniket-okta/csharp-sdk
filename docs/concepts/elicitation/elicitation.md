@@ -10,8 +10,9 @@ uid: elicitation
 The **elicitation** feature allows servers to request additional information from users during interactions. This enables more dynamic and interactive AI experiences, making it easier to gather necessary context before executing tasks.
 
 The protocol supports two modes of elicitation:
-- **Form (In-Band)**: The server requests structured data (strings, numbers, booleans, enums) which the client collects via a form interface and returns to the server.
-- **URL Mode**: The server provides a URL for the user to visit (e.g., for OAuth, payments, or sensitive data entry). The interaction happens outside the MCP client.
+
+- **Form (In-Band)**: The server requests structured data (strings, numbers, Booleans, enums) which the client collects via a form interface and returns to the server.
+- **URL Mode**: The server provides a URL for the user to visit (for example, for OAuth, payments, or sensitive data entry). The interaction happens outside the MCP client.
 
 ### Server Support for Elicitation
 
@@ -32,6 +33,80 @@ For enum types, the SDK supports several schema formats:
 - **UntitledMultiSelectEnumSchema**: A multi-select enum allowing multiple values to be selected.
 - **TitledMultiSelectEnumSchema**: A multi-select enum with display titles for each option.
 - **LegacyTitledEnumSchema** (deprecated): The legacy enum schema using `enumNames` for backward compatibility.
+
+#### Default values
+
+Each schema type supports a `Default` property that specifies a pre-populated value for the form field.
+Clients should use defaults to pre-fill form fields, making it easier for users to accept common values or see expected input formats.
+
+```csharp
+var result = await server.ElicitAsync(new ElicitRequestParams
+{
+    Message = "Configure your preferences",
+    RequestedSchema = new ElicitRequestParams.RequestSchema
+    {
+        Properties = new Dictionary<string, ElicitRequestParams.PrimitiveSchemaDefinition>
+        {
+            ["name"] = new ElicitRequestParams.StringSchema
+            {
+                Description = "Your display name",
+                Default = "User"
+            },
+            ["maxResults"] = new ElicitRequestParams.NumberSchema
+            {
+                Description = "Maximum number of results",
+                Default = 25
+            },
+            ["enableNotifications"] = new ElicitRequestParams.BooleanSchema
+            {
+                Description = "Enable push notifications",
+                Default = true
+            },
+            ["theme"] = new ElicitRequestParams.UntitledSingleSelectEnumSchema
+            {
+                Description = "UI theme",
+                Enum = ["light", "dark", "system"],
+                Default = "system"
+            }
+        }
+    }
+}, cancellationToken);
+```
+
+#### Enum schema formats
+
+Enum schemas allow the server to present a set of choices to the user.
+
+- <xref:ModelContextProtocol.Protocol.ElicitRequestParams.UntitledSingleSelectEnumSchema>: Simple single-select where enum values serve as both the value and display text.
+- <xref:ModelContextProtocol.Protocol.ElicitRequestParams.TitledSingleSelectEnumSchema>: Single-select with separate display titles for each option using JSON Schema `oneOf` with `const` and `title`.
+- <xref:ModelContextProtocol.Protocol.ElicitRequestParams.UntitledMultiSelectEnumSchema>: Multi-select allowing multiple values.
+- <xref:ModelContextProtocol.Protocol.ElicitRequestParams.TitledMultiSelectEnumSchema>: Multi-select with display titles.
+
+```csharp
+// Titled single-select: display titles differ from values
+["priority"] = new ElicitRequestParams.TitledSingleSelectEnumSchema
+{
+    Description = "Task priority",
+    OneOf =
+    [
+        new() { Const = "p0", Title = "Critical (P0)" },
+        new() { Const = "p1", Title = "High (P1)" },
+        new() { Const = "p2", Title = "Normal (P2)" },
+    ],
+    Default = "p2"
+},
+
+// Multi-select: user can select multiple values
+["tags"] = new ElicitRequestParams.UntitledMultiSelectEnumSchema
+{
+    Description = "Tags to apply",
+    Items = new()
+    {
+        Enum = ["bug", "feature", "docs", "test"]
+    },
+    Default = ["bug"]
+}
+```
 
 The server can request a single input or multiple inputs at once.
 To help distinguish multiple inputs, each input has a unique name.
@@ -97,7 +172,7 @@ Here's an example implementation of how a console application might handle elici
 
 ### URL Elicitation Required Error
 
-When a tool cannot proceed without first completing a URL-mode elicitation (for example, when third-party OAuth authorization is needed), and calling `ElicitAsync` is not practical (for example in <xref: ModelContextProtocol.AspNetCore.HttpServerTransportOptions.Stateless> is enabled disabling server-to-client requets), the server may throw a <xref:ModelContextProtocol.UrlElicitationRequiredException>. This is a specialized error (JSON-RPC error code `-32042`) that signals to the client that one or more URL-mode elicitations must be completed before the original request can be retried.
+When a tool cannot proceed without first completing a URL-mode elicitation (for example, when third-party OAuth authorization is needed), and calling `ElicitAsync` is not practical (for example in [stateless](xref:stateless) mode where server-to-client requests are disabled), the server may throw a <xref:ModelContextProtocol.UrlElicitationRequiredException>. This is a specialized error (JSON-RPC error code `-32042`) that signals to the client that one or more URL-mode elicitations must be completed before the original request can be retried.
 
 #### Throwing UrlElicitationRequiredException on the Server
 
@@ -208,6 +283,7 @@ await using var completionHandler = client.RegisterNotificationHandler(
 ```
 
 This pattern is particularly useful for:
+
 - **Third-party OAuth flows**: When the MCP server needs to obtain tokens from external services on behalf of the user
 - **Payment processing**: When user confirmation is required through a secure payment interface
 - **Sensitive credential collection**: When API keys or other secrets must be entered directly on a trusted server page rather than through the MCP client

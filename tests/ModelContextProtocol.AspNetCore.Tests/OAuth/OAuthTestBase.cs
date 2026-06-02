@@ -8,7 +8,6 @@ using ModelContextProtocol.AspNetCore.Authentication;
 using ModelContextProtocol.AspNetCore.Tests.Utils;
 using ModelContextProtocol.Authentication;
 using System.Net;
-using Xunit.Sdk;
 
 namespace ModelContextProtocol.AspNetCore.Tests.OAuth;
 
@@ -56,7 +55,7 @@ public abstract class OAuthTestBase : KestrelInMemoryTest, IAsyncDisposable
             {
                 options.ResourceMetadata = new ProtectedResourceMetadata
                 {
-                    AuthorizationServers = { new Uri(OAuthServerUrl) },
+                    AuthorizationServers = { OAuthServerUrl },
                     ScopesSupported = ["mcp:tools"]
                 };
             }
@@ -82,14 +81,23 @@ public abstract class OAuthTestBase : KestrelInMemoryTest, IAsyncDisposable
         }
     }
 
-    protected async Task<WebApplication> StartMcpServerAsync(string path = "", string? authScheme = null)
+    protected async Task<WebApplication> StartMcpServerAsync(string path = "", string? authScheme = null, Action<WebApplication>? configureMiddleware = null)
     {
-        Builder.Services.PostConfigure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, options =>
+        // Wait for the OAuth server to be ready before starting the MCP server.
+        // This prevents race conditions in CI where the OAuth server may not be
+        // fully initialized when the first test request is made.
+        await TestOAuthServer.ServerStarted.WaitAsync(TestContext.Current.CancellationToken);
+
+        Builder.Services.Configure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, options =>
         {
             options.TokenValidationParameters.ValidAudience = $"{McpServerUrl}{path}";
         });
 
         var app = Builder.Build();
+        
+        // Allow tests to add custom middleware before MapMcp
+        configureMiddleware?.Invoke(app);
+        
         app.MapMcp(path).RequireAuthorization(new AuthorizeAttribute
         {
             AuthenticationSchemes = authScheme

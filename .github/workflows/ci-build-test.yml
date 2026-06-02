@@ -16,6 +16,8 @@ on:
       - "*.props"
       - "Makefile"
       - "global.json"
+      - "package.json"
+      - "package-lock.json"
       - "src/**"
       - "tests/**"
       - "samples/**"
@@ -36,45 +38,34 @@ jobs:
 
     steps:
     - name: 📥 Clone the repo
-      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
 
     - name: 🔧 Set up .NET
-      uses: actions/setup-dotnet@2016bd2012dba4e32de620c46fe006a3ac9f0602 # v5.0.1
+      uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5.2.0
       with:
         dotnet-version: |
           10.0.x
           9.0.x
 
-    # NetFX testing on non-Windows requires mono
-    - name: 🔧 Setup Mono
-      if: runner.os == 'Linux'
-      run: sudo apt-get install -y mono-devel
-
-    - name: 🔧 Setup Mono on macOS
-      if: runner.os == 'macOS'
-      run: brew install mono
-
     - name: 🔧 Set up Node.js
-      uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
       with:
-        node-version: '20'
+        node-version: '22'
 
-    - name: 📦 Install dependencies for tests
-      run: npm install @modelcontextprotocol/server-everything
-
-    - name: 📦 Install dependencies for tests
-      run: npm install @modelcontextprotocol/server-memory
-
-    - name: 📦 Install dependencies for tests
-      run: npm install @modelcontextprotocol/conformance
+    - name: 📦 Install pinned npm dependencies for tests
+      run: npm ci
 
     - name: 🏗️ Build
       run: make build CONFIGURATION=${{ matrix.configuration }}
 
     - name: 🧪 Test
       run: make test CONFIGURATION=${{ matrix.configuration }}
+
+    - name: 🧪 AOT Compatibility
+      if: matrix.configuration == 'Release'
+      run: make test-aot CONFIGURATION=${{ matrix.configuration }}
 
     - name: 📦 Pack
       if: matrix.configuration == 'Release'
@@ -85,7 +76,7 @@ jobs:
 
     - name: 📤 Upload test results artifact
       if: always()
-      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: testresults-${{ matrix.os }}-${{ matrix.configuration }}
         path: artifacts/testresults/**

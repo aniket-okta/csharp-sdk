@@ -84,7 +84,7 @@ public static class RequestMethods
     public const string CompletionComplete = "completion/complete";
 
     /// <summary>
-    /// The name of the request method sent from the server to sample an large language model (LLM) via the client.
+    /// The name of the request method sent from the server to sample a large language model (LLM) via the client.
     /// </summary>
     /// <remarks>
     /// This request allows servers to utilize an LLM available on the client side to generate text or image responses
@@ -113,7 +113,7 @@ public static class RequestMethods
     public const string ElicitationCreate = "elicitation/create";
 
     /// <summary>
-    /// The name of the request method sent from the client to the server when it first connects, asking it initialize.
+    /// The name of the request method sent from the client to the server when it first connects, asking it to initialize.
     /// </summary>
     /// <remarks>
     /// The initialize request is the first request sent by the client to the server. It provides client information
@@ -121,4 +121,32 @@ public static class RequestMethods
     /// and information, establishing the protocol version and available features for the session.
     /// </remarks>
     public const string Initialize = "initialize";
+
+    /// <summary>
+    /// The name of the request method to retrieve task status.
+    /// </summary>
+    /// <remarks>
+    /// Requestors poll for task completion by sending tasks/get requests. They should respect
+    /// the pollInterval provided in responses when determining polling frequency.
+    /// </remarks>
+    public const string TasksGet = "tasks/get";
+
+    /// <summary>
+    /// The name of the request method to retrieve the result of a completed task.
+    /// </summary>
+    /// <remarks>
+    /// This request blocks until the task reaches a terminal status (completed, failed, or cancelled).
+    /// The result structure matches the original request type (e.g., CallToolResult for tools/call).
+    /// </remarks>
+    public const string TasksResult = "tasks/result";
+
+    /// <summary>
+    /// The name of the request method to retrieve a list of tasks with pagination support.
+    /// </summary>
+    public const string TasksList = "tasks/list";
+
+    /// <summary>
+    /// The name of the request method to explicitly cancel a task.
+    /// </summary>
+    public const string TasksCancel = "tasks/cancel";
 }

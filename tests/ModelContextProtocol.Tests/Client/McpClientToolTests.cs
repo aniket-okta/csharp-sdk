@@ -37,13 +37,13 @@ public class McpClientToolTests : ClientServerTestBase
         [McpServerTool]
         public static ImageContentBlock ImageTool() =>
             new()
-            { Data = Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-image-data")), MimeType = "image/png" };
+            { Data = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-image-data"))), MimeType = "image/png" };
 
         // Tool that returns audio content as single ContentBlock
         [McpServerTool]
         public static AudioContentBlock AudioTool() =>
             new()
-            { Data = Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-audio-data")), MimeType = "audio/mp3" };
+            { Data = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-audio-data"))), MimeType = "audio/mp3" };
 
         // Tool that returns embedded resource
         [McpServerTool]
@@ -103,7 +103,7 @@ public class McpClientToolTests : ClientServerTestBase
         [McpServerTool]
         public static IEnumerable<ContentBlock> MixedWithNonConvertibleTool()
         {
-            yield return new ImageContentBlock { Data = Convert.ToBase64String(Encoding.UTF8.GetBytes("image-data")), MimeType = "image/png" };
+            yield return new ImageContentBlock { Data = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("image-data"))), MimeType = "image/png" };
             yield return new ResourceLinkBlock { Uri = "file://linked.txt", Name = "linked.txt" };
         }
 
@@ -122,7 +122,7 @@ public class McpClientToolTests : ClientServerTestBase
             new()
             {
                 Content = [new TextContentBlock { Text = "Regular content" }],
-                StructuredContent = JsonNode.Parse("{\"key\":\"value\"}")
+                StructuredContent = JsonElement.Parse("{\"key\":\"value\"}")
             };
 
         // Tool that returns CallToolResult with Meta
@@ -152,7 +152,7 @@ public class McpClientToolTests : ClientServerTestBase
                 Resource = new BlobResourceContents
                 {
                     Uri = "data://blob",
-                    Blob = Convert.ToBase64String(Encoding.UTF8.GetBytes("binary-data")),
+                    Blob = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("binary-data"))),
                     MimeType = "application/octet-stream"
                 }
             };
@@ -161,9 +161,17 @@ public class McpClientToolTests : ClientServerTestBase
         [McpServerTool]
         public static TextContentBlock MetadataEchoTool(RequestContext<CallToolRequestParams> context)
         {
-            var meta = context.Params?.Meta;
+            var meta = context.Params.Meta;
             var metaJson = meta?.ToJsonString() ?? "{}";
             return new TextContentBlock { Text = metaJson };
+        }
+
+        // Tool that accepts arbitrary JsonElement parameter to test anonymous type serialization
+        [McpServerTool]
+        public static TextContentBlock ArgumentEchoTool(string text, JsonElement coordinates)
+        {
+            var result = new { text, coordinates };
+            return new TextContentBlock { Text = JsonSerializer.Serialize(result) };
         }
     }
 
@@ -817,5 +825,128 @@ public class McpClientToolTests : ClientServerTestBase
         var receivedMetadata = JsonNode.Parse(textBlock.Text)?.AsObject();
         Assert.NotNull(receivedMetadata);
         Assert.Equal("requestOnlyValue", receivedMetadata["requestOnlyKey"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task CallToolAsync_WithAnonymousTypeArguments_Works()
+    {
+        if (!JsonSerializer.IsReflectionEnabledByDefault)
+        {
+            return;
+        }
+
+        await using McpClient client = await CreateMcpClientForServer();
+
+        // Call with dictionary containing anonymous type values
+        var arguments = new Dictionary<string, object?>
+        {
+            ["text"] = "test",
+            ["coordinates"] = new { X = 1.0, Y = 2.0 }  // Anonymous type
+        };
+
+        // This should not throw NotSupportedException
+        var result = await client.CallToolAsync("argument_echo_tool", arguments, cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Content);
+        
+        // Verify the anonymous type was serialized correctly
+        var textBlock = Assert.IsType<TextContentBlock>(result.Content[0]);
+        Assert.Contains("coordinates", textBlock.Text);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WithProgress_ProgressTokenInMeta(bool useInvokeAsync)
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "metadata_echo_tool");
+
+        var receivedMetadata = await CallMetadataEchoToolWithProgressAsync(tool, useInvokeAsync);
+        Assert.NotNull(receivedMetadata);
+        Assert.NotNull(receivedMetadata["progressToken"]?.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WithMeta_WithProgress_BothMetaAndProgressTokenPresent(bool useInvokeAsync)
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "metadata_echo_tool")
+            .WithMeta(new() { ["traceId"] = "trace-123" });
+
+        var receivedMetadata = await CallMetadataEchoToolWithProgressAsync(tool, useInvokeAsync);
+        Assert.NotNull(receivedMetadata);
+        Assert.Equal("trace-123", receivedMetadata["traceId"]?.GetValue<string>());
+        Assert.NotNull(receivedMetadata["progressToken"]?.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WithMeta_WithProgress_DoesNotMutateOriginalMeta(bool useInvokeAsync)
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "metadata_echo_tool");
+
+        JsonObject originalMeta = new() { ["traceId"] = "trace-789" };
+        var toolWithMeta = tool.WithMeta(originalMeta);
+
+        await CallMetadataEchoToolWithProgressAsync(toolWithMeta, useInvokeAsync);
+        await CallMetadataEchoToolWithProgressAsync(toolWithMeta, useInvokeAsync);
+
+        Assert.Single(originalMeta);
+        Assert.Equal("trace-789", originalMeta["traceId"]?.GetValue<string>());
+        Assert.False(originalMeta.ContainsKey("progressToken"));
+    }
+
+    [Fact]
+    public async Task WithMeta_WithProgress_WithRequestOptionsMeta_AllMerged()
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "metadata_echo_tool")
+            .WithMeta(new() { ["toolKey"] = "toolValue" });
+
+        RequestOptions requestOptions = new()
+        {
+            Meta = new() { ["requestKey"] = "requestValue" }
+        };
+
+        var receivedMetadata = await CallMetadataEchoToolWithProgressAsync(tool, useInvokeAsync: false, requestOptions);
+        Assert.NotNull(receivedMetadata);
+        Assert.Equal("toolValue", receivedMetadata["toolKey"]?.GetValue<string>());
+        Assert.Equal("requestValue", receivedMetadata["requestKey"]?.GetValue<string>());
+        Assert.NotNull(receivedMetadata["progressToken"]?.GetValue<string>());
+    }
+
+    private static async Task<JsonObject?> CallMetadataEchoToolWithProgressAsync(
+        McpClientTool tool, bool useInvokeAsync, RequestOptions? options = null)
+    {
+        var progress = new Progress<ProgressNotificationValue>();
+        string text;
+
+        if (useInvokeAsync)
+        {
+            tool = tool.WithProgress(progress);
+            var result = await tool.InvokeAsync(cancellationToken: TestContext.Current.CancellationToken);
+            text = Assert.IsType<TextContent>(result).Text;
+        }
+        else
+        {
+            var result = await tool.CallAsync(progress: progress, options: options, cancellationToken: TestContext.Current.CancellationToken);
+            text = Assert.IsType<TextContentBlock>(result.Content.Single()).Text;
+        }
+
+        return JsonNode.Parse(text)?.AsObject();
     }
 }
